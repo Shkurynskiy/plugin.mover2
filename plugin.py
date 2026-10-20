@@ -39,6 +39,7 @@ class Settings(PluginSettings):
         "recreate_directory_structure": True,
         "include_library_structure":    True,
         "remove_source_file":           False,
+        "preserve_file_mtime":          True,
     }
 
     def __init__(self, *args, **kwargs):
@@ -57,6 +58,9 @@ class Settings(PluginSettings):
             "include_library_structure":    self.__set_include_library_structure(),
             "remove_source_file":           {
                 "label": "Remove source files",
+            },
+            "preserve_file_mtime":          {
+                "label": "Preserve original file modification time (mtime)",
             },
         }
 
@@ -317,6 +321,29 @@ def on_postprocessor_task_results(data):
             logger.error(
                 "Detected that the file movement did not complete correctly. Dont do anything with the source file.")
             return data
+    # Apply preserved mtime to destination file if enabled
+    if settings.get_setting('preserve_file_mtime'):
+        file_out_path = file_movement_data.get('file_out')
+        source_mtime = file_movement_data.get('source_mtime')
+        source_atime = file_movement_data.get('source_atime')
+
+        # Fallback: read directly from original source if file wasn't recorded
+        if not source_mtime and os.path.exists(original_source_path):
+            try:
+                stat_info = os.stat(original_source_path)
+                source_atime = stat_info.st_atime
+                source_mtime = stat_info.st_mtime
+            except Exception as e:
+                logger.error("Unable to read original source stat: {}".format(e))
+
+        if file_out_path and os.path.exists(file_out_path) and source_mtime:
+            try:
+                atime_to_set = source_atime if source_atime is not None else source_mtime
+                os.utime(file_out_path, (atime_to_set, source_mtime))
+                logger.info("Successfully preserved original mtime ({}) on destination file '{}'".format(source_mtime, file_out_path))
+            except Exception as e:
+                logger.error("Failed to set mtime on destination file '{}': {}".format(file_out_path, e))
+     
     # If the above check was fine, then the file movement that this plugin requested was successful
 
     # If the source file and destination file are named the exact same thing (including extension), then the file
