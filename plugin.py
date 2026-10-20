@@ -194,21 +194,6 @@ def on_library_management_file_test(data, task_data_store=None, file_metadata=No
 def on_postprocessor_file_movement(data, task_data_store=None, file_metadata=None):
     """
     Runner function - configures additional postprocessor file movements during the postprocessor stage of a task.
-
-    The 'data' object argument includes:
-        library_id              - Integer, the library that the current task is associated with.
-        source_data             - Dictionary, data pertaining to the original source file.
-        remove_source_file      - Boolean, should Unmanic remove the original source file after all copy operations
-                                  are complete. (default: 'True' if file name has changed)
-        copy_file               - Boolean, should Unmanic run a copy operation with the returned data variables.
-                                  (default: 'False')
-        file_in                 - String, the converted cache file to be copied by the postprocessor.
-        file_out                - String, the destination file that the file will be copied to.
-        run_default_file_copy   - Boolean, should Unmanic run the default post-process file movement. (default: 'True')
-
-    :param data:
-    :return:
-
     """
     # Configure settings object (maintain compatibility with v1 plugins)
     if data.get('library_id'):
@@ -224,8 +209,18 @@ def on_postprocessor_file_movement(data, task_data_store=None, file_metadata=Non
 
     unmanic_destination_file = data.get('file_out')
 
+    # Read timestamps from the original source file
+    source_atime = None
+    source_mtime = None
+    if original_source_path and os.path.exists(original_source_path):
+        try:
+            stat_info = os.stat(original_source_path)
+            source_atime = stat_info.st_atime
+            source_mtime = stat_info.st_mtime
+        except Exception as e:
+            logger.error("Unable to read source file stat for '{}': {}".format(original_source_path, e))
+
     # Should the plugin remove the source file?
-    # If remove source file is not selected, then prevent the removal of the source file
     data['remove_source_file'] = settings.get_setting('remove_source_file')
     # Always prevent Unmanic from running the default file movement (requires Unmanic v0.2.0)
     data['run_default_file_copy'] = False
@@ -238,28 +233,20 @@ def on_postprocessor_file_movement(data, task_data_store=None, file_metadata=Non
     # Set plugin to copy file
     data['copy_file'] = True
 
-    # Store some required data in a JSON file for the on_postprocessor_task_results runner.
-    # If the source needs to be removed, then we will handle that with the other plugin runner. Notes below...
-    # For now, save the current file_out (which is Unmanic's destination file once all plugins are run) to a file.
-    # We also want to store a checksum of the cache file to ensure that the file movement was completed correctly.
+    # Store required data in JSON file for on_postprocessor_task_results
     profile_directory = settings.get_profile_directory()
-    # Use the basename of the source path to create a unique file for storing the file_out data.
-    # This can then be read and used by the on_postprocessor_task_results function below.
     src_file_hash = hashlib.md5(original_source_path.encode('utf8')).hexdigest()
     plugin_data_file = os.path.join(profile_directory, '{}.json'.format(src_file_hash))
     with open(plugin_data_file, 'w') as f:
         required_data = {
             'file_out':                 file_out,
             'unmanic_destination_file': unmanic_destination_file,
+            'source_atime':             source_atime,
+            'source_mtime':             source_mtime,
         }
         json.dump(required_data, f, indent=4)
 
     if not settings.get_setting('remove_source_file'):
-        # Get the original file's absolute path
-        original_source_path = data.get('source_data', {}).get('abspath')
-        if not original_source_path:
-            logger.error("Provided 'source_data' is missing the source file abspath data.")
-            return data
         if not os.path.exists(original_source_path):
             logger.error("Original source path could not be found.")
             return data
@@ -278,16 +265,6 @@ def on_postprocessor_file_movement(data, task_data_store=None, file_metadata=Non
 def on_postprocessor_task_results(data):
     """
     Runner function - provides a means for additional postprocessor functions based on the task success.
-
-    The 'data' object argument includes:
-        task_processing_success         - Boolean, did all task processes complete successfully.
-        file_move_processes_success     - Boolean, did all postprocessor movement tasks complete successfully.
-        destination_files               - List containing all file paths created by postprocessor file movements.
-        source_data                     - Dictionary containing data pertaining to the original source file.
-
-    :param data:
-    :return:
-
     """
     # Configure settings object (maintain compatibility with v1 plugins)
     if data.get('library_id'):
@@ -303,7 +280,6 @@ def on_postprocessor_task_results(data):
 
     # Read the data from the on_postprocessor_file_movement runner
     profile_directory = settings.get_profile_directory()
-    # Get the file out and store
     src_file_hash = hashlib.md5(original_source_path.encode('utf8')).hexdigest()
     plugin_data_file = os.path.join(profile_directory, '{}.json'.format(src_file_hash))
     if not os.path.exists(plugin_data_file):
@@ -314,13 +290,11 @@ def on_postprocessor_task_results(data):
 
     # Ensure the file was correctly moved as required
     if not data.get('file_move_processes_success'):
-        # A plugin failed in its file movements. It may not have been this one... Check file
         if not file_movement_data.get('file_out') in data.get('destination_files'):
-            # The file that this plugin requested that Unmanic move to does not exist in the 'destination_files' list
-            # This means that the file did not successfully copy
             logger.error(
                 "Detected that the file movement did not complete correctly. Dont do anything with the source file.")
             return data
+
     # Apply preserved mtime to destination file if enabled
     if settings.get_setting('preserve_file_mtime'):
         file_out_path = file_movement_data.get('file_out')
@@ -343,16 +317,9 @@ def on_postprocessor_task_results(data):
                 logger.info("Successfully preserved original mtime ({}) on destination file '{}'".format(source_mtime, file_out_path))
             except Exception as e:
                 logger.error("Failed to set mtime on destination file '{}': {}".format(file_out_path, e))
-     
-    # If the above check was fine, then the file movement that this plugin requested was successful
 
-    # If the source file and destination file are named the exact same thing (including extension), then the file
-    #   may already be removed by setting 'remove_source_file' in the on_postprocessor_file_movement function.
-    # However, if the file's name had changed at all, then the "source" file will have been replaced by the
-    #   newly named file. Unmanic's default process is to replace the file with the processed one. This section
-    #   ensures that these replaced files are cleaned up if the plugin is configured to remove the source files.
+    # Remove source file if configured
     if settings.get_setting('remove_source_file'):
-        # Plugin configured to remove the source file.
         unmanic_destination_file = os.path.abspath(file_movement_data.get('unmanic_destination_file'))
         if os.path.exists(unmanic_destination_file):
             logger.debug("Plugin is configured to ensure the original file is removed. Removing file '{}'".format(
